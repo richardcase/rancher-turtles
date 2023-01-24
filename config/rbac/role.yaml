@@ -62,3 +62,12 @@ rules:
   - update
   - delete
   - patch
+- apiGroups:
+  - management.cattle.io
+  resources:
+  - clusterregistrationtokens
+  - clusterregistrationtokens/status
+  verbs:
+  - get
+  - list
+  - watch

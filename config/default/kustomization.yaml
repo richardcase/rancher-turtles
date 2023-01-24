@@ -38,10 +38,5 @@ patchesStrategicMerge:
 - manager_pull_policy.yaml
 - manager_role_aggregation_patch.yaml
 
-
-
-
-#
-
 configurations:
   - kustomizeconfig.yaml

@@ -11,7 +11,7 @@ load('ext://namespace', 'namespace_create')
 version_settings(True, ">=0.22.2")
 
 settings = {
-    "k8s_context": os.getenv("RT_K8s_CONTEXT", "k3d-rancher-test"),
+    "k8s_context": os.getenv("RT_K8S_CONTEXT", "rancher-desktop"),
     "debug": {},
     "default_registry": "docker.io/richardcase"
 }
@@ -40,7 +40,7 @@ always_enable_projects = ["turtles"]
 projects = {
     "turtles": {
         "context": ".",
-        "image": "richardcase/rancher-turtles",
+        "image": "ghcr.io/richardcase/rancher-turtles-arm64",
         "live_reload_deps": [
             "main.go",
             "go.mod",

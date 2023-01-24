@@ -98,7 +98,7 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
-      serviceAccountName: -manager
+      serviceAccountName: manager
       terminationGracePeriodSeconds: 10
       tolerations:
         - effect: NoSchedule
