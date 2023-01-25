@@ -12,6 +12,7 @@ rules:
   - configmaps
   - events
   - secrets
+  - namespaces
   verbs:
   - create
   - delete

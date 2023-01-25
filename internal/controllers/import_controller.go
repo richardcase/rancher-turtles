@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/richardcase/rancher-turtles/internal/patcher"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/controllers/remote"
@@ -18,15 +20,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/cli-runtime/pkg/resource"
 	"k8s.io/kubectl/pkg/util"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -39,6 +38,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	importLabelName = "rancher-auto-import"
 )
 
 var (
@@ -74,58 +77,65 @@ func (r *CAPIImportReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// fethc the rancher clusters
-	rancherCluster, err := getOwnerRancherCluster(ctx, r.Client, capiCluster.ObjectMeta)
+	// fetch the rancher clusters
+	rancherCluster, err := getRancherClusterByName(ctx, r.Client, capiCluster.Namespace, capiCluster.Name)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{Requeue: true}, err
 		}
 	}
 
-	if capiCluster.ObjectMeta.DeletionTimestamp.IsZero() {
-		//TODO: handle delete
-
+	if !capiCluster.ObjectMeta.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, capiCluster, rancherCluster)
 	}
 
 	return r.reconcileNormal(ctx, capiCluster, rancherCluster)
 }
 
-func (r *CAPIImportReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+func (r *CAPIImportReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
 	log := log.FromContext(ctx)
 
 	//TODO: we want the control plane initialized but removing for the time being
 	//capiPredicates := predicates.All(log, predicates.ClusterControlPlaneInitialized(log), predicates.ResourceHasFilterLabel(log, r.WatchFilterValue))
 	capiPredicates := predicates.All(log, predicates.ResourceHasFilterLabel(log, r.WatchFilterValue))
 
-	c, err := ctrl.NewControllerManagedBy(mgr).For(&clusterv1.Cluster{}).WithEventFilter(capiPredicates).Build(r)
+	c, err := ctrl.NewControllerManagedBy(mgr).
+		For(&clusterv1.Cluster{}).
+		WithOptions(options).
+		WithEventFilter(capiPredicates).
+		Build(r)
 	if err != nil {
 		return fmt.Errorf("creating new controller: %w", err)
 	}
 
-	// err = c.Watch(
-	// 	&source.Kind{Type: &rancherv1.Cluster{}},
-	// 	handler.EnqueueRequestsFromMapFunc(r.rancherClusterToCapiCluster),
-	// )
-	// if err != nil {
-	// 	return fmt.Errorf("adding watch for Rancher cluster: %w", err)
-	// }
-
-	r.recorder = mgr.GetEventRecorderFor("rancher-turtles")
-	r.controller = c
-	r.externalTracker = external.ObjectTracker{
-		Controller: c,
-	}
-
+	// Watch Rancher provisioningv2 clusters
+	// NOTE: we will import the types from rancher in the future
 	gvk := schema.GroupVersionKind{Group: "provisioning.cattle.io", Version: "v1", Kind: "Cluster"}
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(gvk)
 
 	err = c.Watch(
 		&source.Kind{Type: u},
-		&handler.EnqueueRequestForOwner{OwnerType: &clusterv1.Cluster{}},
+		handler.EnqueueRequestsFromMapFunc(r.rancherClusterToCapiCluster(ctx)),
+		//&handler.EnqueueRequestForOwner{OwnerType: &clusterv1.Cluster{}},
 	)
 	if err != nil {
 		return fmt.Errorf("adding watch for Rancher cluster: %w", err)
+	}
+
+	ns := &corev1.Namespace{}
+	err = c.Watch(
+		&source.Kind{Type: ns},
+		handler.EnqueueRequestsFromMapFunc(r.namespaceToCapiClusters(ctx)),
+	)
+	if err != nil {
+		return fmt.Errorf("adding watch for namespaces: %w", err)
+	}
+
+	r.recorder = mgr.GetEventRecorderFor("rancher-turtles")
+	r.controller = c
+	r.externalTracker = external.ObjectTracker{
+		Controller: c,
 	}
 
 	return nil
@@ -136,6 +146,15 @@ func (r *CAPIImportReconciler) reconcileNormal(ctx context.Context, capiCluster 
 	log.Info("Reconciling CAPI Cluster")
 
 	if rancherCluster == nil {
+		shouldImport, err := r.shouldAutoImport(ctx, capiCluster)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !shouldImport {
+			log.Info("not auto importing cluster as namespace isn't marked auto import", "clustername", capiCluster.Name, "namespace", capiCluster.Namespace)
+			return ctrl.Result{}, nil
+		}
+
 		if err := r.createRancherCluster(ctx, capiCluster); err != nil {
 			log.Error(err, "failed creating rancher cluster")
 			return ctrl.Result{}, err
@@ -144,7 +163,12 @@ func (r *CAPIImportReconciler) reconcileNormal(ctx context.Context, capiCluster 
 	}
 
 	// Get the cluster name
-	clusterName, ok := rancherCluster.Object["status"].(map[string]interface{})["clusterName"]
+	clusterStatus, ok := rancherCluster.Object["status"]
+	if !ok {
+		log.Info("cluster status not set, requeue")
+		return ctrl.Result{Requeue: true}, nil
+	}
+	clusterName, ok := clusterStatus.(map[string]interface{})["clusterName"]
 	if !ok {
 		log.Info("clusterName not set, requeue")
 		return ctrl.Result{Requeue: true}, nil
@@ -174,6 +198,40 @@ func (r *CAPIImportReconciler) reconcileNormal(ctx context.Context, capiCluster 
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+func (r *CAPIImportReconciler) shouldAutoImport(ctx context.Context, capiCluster *clusterv1.Cluster) (bool, error) {
+	log := log.FromContext(ctx)
+	log.V(2).Info("should we auto import the capi cluster", "name", capiCluster.Name, "namespace", capiCluster.Namespace)
+
+	ns := &corev1.Namespace{}
+	key := client.ObjectKey{Name: capiCluster.Namespace}
+	if err := r.Client.Get(ctx, key, ns); err != nil {
+		log.Error(err, "getting namespace")
+		return false, err
+	}
+
+	labelVal, ok := ns.Labels[importLabelName]
+	if !ok {
+		log.V(2).Info("Namespace does not have label")
+		return false, nil
+	}
+	autoImport, err := strconv.ParseBool(labelVal)
+	if err != nil {
+		log.Error(err, fmt.Sprintf("Parsing label value: %s", labelVal))
+		return false, err
+	}
+
+	return autoImport, nil
+}
+
+func (r *CAPIImportReconciler) reconcileDelete(ctx context.Context, capiCluster *clusterv1.Cluster, rancherCluster *unstructured.Unstructured) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+	log.Info("Reconciling CAPI Cluster Delete")
+
+	//TODO: add implementation
+
+	return ctrl.Result{}, nil
 }
 
 func (r *CAPIImportReconciler) getClusterRegistrationManifest(ctx context.Context, clusterName string) (string, error) {
@@ -213,30 +271,12 @@ func (r *CAPIImportReconciler) applyImportManifest(ctx context.Context, capiClus
 	}
 	restConfig.Timeout = 1 * time.Minute
 
-	scheme := runtime.NewScheme()
-	_ = appsv1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = rbacv1.AddToScheme(scheme)
-
-	// dynamicClient, err := dynamic.NewForConfig(restConfig)
-	// if err != nil {
-	// 	return fmt.Errorf("getting dynamic client: %w", err)
-	// }
-
-	// remoteClient, err := client.New(restConfig, client.Options{Scheme: scheme})
-	// if err != nil {
-	// 	return fmt.Errorf("getting remote client: %w", err)
-	// }
-
 	objs, err := manifestToObjects(strings.NewReader(manifest))
 	if err != nil {
 		return fmt.Errorf("getting objects from manifest: %w", err)
 	}
 
 	for _, obj := range objs {
-		//remoteClient.Create(ctx, obj)
-		//gvk := obj.GetObjectKind().GroupVersionKind()
-		//res := schema.GroupVersionResource{Group: gvk.Group, Version: gvk.Version, Resource: gvk.Kind}
 		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 		if err != nil {
 			return err
@@ -244,21 +284,15 @@ func (r *CAPIImportReconciler) applyImportManifest(ctx context.Context, capiClus
 		unstructuredObj := &unstructured.Unstructured{}
 		unstructuredObj.SetUnstructuredContent(u)
 
-		// _, err = dynamicClient.Resource(res).Create(ctx, unstructuredObj, metav1.CreateOptions{})
-		// if err != nil {
-		// 	return err
-		// }
-
-		if createErr := createObject2(restConfig, unstructuredObj); createErr != nil {
+		if createErr := createObject(restConfig, unstructuredObj, &log); createErr != nil {
 			return err
 		}
 	}
 
-	//TODO: apply the manifests
 	return nil
 }
 
-func createObject(cfg *rest.Config, obj *unstructured.Unstructured) error {
+func createObject(cfg *rest.Config, obj *unstructured.Unstructured, log *logr.Logger) error {
 	gvk := obj.GroupVersionKind()
 
 	discovery, err := discovery.NewDiscoveryClientForConfig(cfg)
@@ -280,42 +314,7 @@ func createObject(cfg *rest.Config, obj *unstructured.Unstructured) error {
 	//gvr := restMapping.Resource
 	gv := gvk.GroupVersion()
 
-	restClient, err := newRestClient(*cfg, gv)
-	if err != nil {
-		return err
-	}
-
-	helper := resource.NewHelper(restClient, restMapping)
-	setDefaultNamespaceIfScopedAndNoneSet(obj, helper)
-	ns := obj.GetNamespace()
-
-	_, err = helper.Create(ns, false, obj)
-
-	return err
-}
-
-func createObject2(cfg *rest.Config, obj *unstructured.Unstructured) error {
-	gvk := obj.GroupVersionKind()
-
-	discovery, err := discovery.NewDiscoveryClientForConfig(cfg)
-	if err != nil {
-		return err
-	}
-
-	groupResources, err := restmapper.GetAPIGroupResources(discovery)
-	if err != nil {
-		return err
-	}
-	rm := restmapper.NewDiscoveryRESTMapper(groupResources)
-
-	restMapping, err := rm.RESTMapping(gvk.GroupKind(), gvk.Version)
-	if err != nil {
-		return err
-	}
-
-	//gvr := restMapping.Resource
-	gv := gvk.GroupVersion()
-
+	log.Info("Creating REST client")
 	restClient, err := newRestClient(*cfg, gv)
 	if err != nil {
 		return err
@@ -356,6 +355,7 @@ func createObject2(cfg *rest.Config, obj *unstructured.Unstructured) error {
 		}
 
 		// Then create the resource and skip the three-way merge
+		log.Info("creating object", "name", info.Name, "namespace", info.Namespace, "gvk", gvk)
 		obj, err := helper.Create(info.Namespace, true, info.Object)
 		if err != nil {
 			return err
@@ -418,15 +418,15 @@ func (r *CAPIImportReconciler) createRancherCluster(ctx context.Context, capiClu
 	})
 	rancherCluster.SetGroupVersionKind(gvkRancherCluster)
 
-	ownerRefs := []metav1.OwnerReference{
-		{
-			Kind:       "Cluster",
-			APIVersion: clusterv1.GroupVersion.Identifier(),
-			Name:       capiCluster.Name,
-			UID:        capiCluster.UID,
-		},
-	}
-	rancherCluster.SetOwnerReferences(ownerRefs)
+	// ownerRefs := []metav1.OwnerReference{
+	// 	{
+	// 		Kind:       "Cluster",
+	// 		APIVersion: clusterv1.GroupVersion.Identifier(),
+	// 		Name:       capiCluster.Name,
+	// 		UID:        capiCluster.UID,
+	// 	},
+	// }
+	// rancherCluster.SetOwnerReferences(ownerRefs)
 
 	if err := r.Client.Create(ctx, rancherCluster); err != nil {
 		return fmt.Errorf("creating rancher cluster: %w", err)
@@ -435,56 +435,78 @@ func (r *CAPIImportReconciler) createRancherCluster(ctx context.Context, capiClu
 	return nil
 }
 
-func (r *CAPIImportReconciler) rancherClusterToCapiCluster(o client.Object) []ctrl.Request {
+func (r *CAPIImportReconciler) rancherClusterToCapiCluster(ctx context.Context) handler.MapFunc {
+	log := log.FromContext(ctx)
 
-	//c, ok := o.(*clusterv1.Cluster)
-	//if !ok {
-	//	r.Log.Error(nil, fmt.Sprintf("Expected a Cluster but got a %T", o))
-	//	return nil
-	//}
-	//
-	//controlPlaneRef := c.Spec.ControlPlaneRef
-	//if controlPlaneRef != nil && controlPlaneRef.Kind == "RKE2ControlPlane" {
-	//	return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: controlPlaneRef.Namespace, Name: controlPlaneRef.Name}}}
-	//}
+	return func(o client.Object) []ctrl.Request {
+		key := client.ObjectKey{Name: o.GetName(), Namespace: o.GetNamespace()}
 
-	return nil
+		capiCluster := &clusterv1.Cluster{}
+		if err := r.Client.Get(ctx, key, capiCluster); err != nil {
+			if !apierrors.IsNotFound(err) {
+				log.Error(err, "getting capi cluster")
+			}
+			return nil
+		}
+
+		return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: capiCluster.Namespace, Name: capiCluster.Name}}}
+	}
 }
 
-func getOwnerRancherCluster(ctx context.Context, c client.Client, obj metav1.ObjectMeta) (*unstructured.Unstructured, error) {
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(gvkRancherClusterList)
+func (r *CAPIImportReconciler) namespaceToCapiClusters(ctx context.Context) handler.MapFunc {
+	log := log.FromContext(ctx)
 
-	if err := c.List(ctx, list); err != nil {
-		return nil, fmt.Errorf("listing rancher clusters: %w", err)
-	}
-
-	for _, u := range list.Items {
-		refs := u.GetOwnerReferences()
-		for _, ref := range refs {
-			if ref.APIVersion == clusterv1.GroupVersion.Identifier() && ref.Kind == "Cluster" && ref.Name == obj.Name {
-				return &u, nil
-			}
+	return func(o client.Object) []ctrl.Request {
+		ns, ok := o.(*corev1.Namespace)
+		if !ok {
+			log.Error(nil, fmt.Sprintf("Expected a Namespace but got a %T", o))
+			return nil
 		}
-	}
 
-	// for _, ref := range obj.OwnerReferences {
-	// 	if ref.Kind != "Cluster" {
-	// 		continue
-	// 	}
-	// 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
-	// 	if err != nil {
-	// 		return nil, errors.WithStack(err)
-	// 	}
-	// 	if gv.Group == "provisioning.cattle.io" {
-	// 		return getRancherClusterByName(ctx, c, obj.Namespace, ref.Name)
-	// 	}
-	// }
-	return nil, nil
+		labelVal, ok := ns.Labels[importLabelName]
+		if !ok {
+			log.V(2).Info("Namespace does not have label, skipping")
+			return nil
+		}
+		autoImport, err := strconv.ParseBool(labelVal)
+		if err != nil {
+			log.Error(err, fmt.Sprintf("Parsing label value: %s", labelVal))
+			return nil
+		}
+
+		if !autoImport {
+			log.V(2).Info("Namespace has auto import label set to false, skipping")
+			return nil
+		}
+
+		capiClusters := &clusterv1.ClusterList{}
+		if err := r.Client.List(ctx, capiClusters, client.InNamespace(o.GetNamespace())); err != nil {
+			log.Error(err, "getting capi cluster")
+			return nil
+		}
+
+		if len(capiClusters.Items) == 0 {
+			log.V(2).Info("No CAPI clusters in namespace, no action")
+			return nil
+		}
+
+		reqs := []ctrl.Request{}
+		for _, cluster := range capiClusters.Items {
+			reqs = append(reqs, ctrl.Request{
+				NamespacedName: client.ObjectKey{
+					Namespace: cluster.Namespace,
+					Name:      cluster.Name,
+				},
+			})
+		}
+
+		return reqs
+	}
 }
 
 func getRancherClusterByName(ctx context.Context, c client.Client, namespace, name string) (*unstructured.Unstructured, error) {
 	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvkRancherCluster)
 	key := client.ObjectKey{Name: name, Namespace: namespace}
 	if err := c.Get(ctx, key, u); err != nil {
 		return nil, err
@@ -503,11 +525,6 @@ func downloadManifest(url string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reading manifest: %w", err)
 	}
-
-	//copyData2 := &bytes.Buffer{}
-	//io.Copy(copyData2, resp.Body)
-
-	//return copyData2.String(), nil
 
 	return string(data), err
 }
